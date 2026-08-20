@@ -1,0 +1,174 @@
+#====================== model.py: ======================#
+
+* UUID = Standard Python library to generate Universally Unique Identifiers (128-bit random strings like c81e7208-410c-403d-...) instead of sequential integer IDs (1, 2, 3...).
+* models = ORM core toold to build DB tables.
+* User = Built-in Django authentication model representing users.
+* TenantScopedManager, UnscopedManager: Custom database query managers:
+    * TenantScopedManager : Automatically filters database queries to only return data belonging to the current active tenant.
+    * UnscopedManager: Queries all database records across all tenants (used for admin/superadmin access).
+
+
+## Tenant Model:
+* name and created as basic attribute
+* id: Unique UUID primary key that cannot be manually edited in the admin.
+
+## Base Class for Tenant Isolation:
+
+* abstract = True: Tells Django not to create a database table for TenantScopedModel. It serves purely as a reusable blueprint/parent class for other models.
+* tenant = tenant = models.ForeignKey(Tenant, ...): Attaches every child model instance to a specific Tenant. on_delete=models.PROTECT prevents deleting a Tenant if it still owns existing database records.
+* objects = TenantScopedManager(): Replaces Django's default objects manager to automatically restrict data queries by tenant.
+* unscoped_objects = UnscopedManager(): Provides explicit access to query records across all tenants.
+* base_manager_name = 'unscoped_objects': Ensures Django internally handles migrations and base operations without getting blocked by tenant filters.
+
+## Customer Model
+
+* Customer(TenantScopedModel): Inherits from TenantScopedModel, meaning a Customer is automatically linked to a Tenant.
+* user: Links a Django auth user to a customer profile within a specific tenant.
+* unique_together = ('tenant', 'user'): A composite database constraint ensuring a single user cannot have duplicate customer profiles under the exact same tenant.
+
+## Wallet Model:
+* customer: Connects the wallet directly to a specific Customer.
+* unique_together = ('tenant', 'customer', 'currency'): Restricts a customer to having at most one wallet per currency within a single tenant.
+* @property def balance(self): Dynamically calculates the wallet balance on the fly by summing up all associated transaction amounts (DEPOSIT positive, WITHDRAW negative) using database aggregation. If no transactions exist, it defaults to 0.
+
+
+## Transaction Model
+* wallet : Points to the target wallet receiving or giving money.
+* amount = Stored as an integer in minor units (e.g., $10.00 USD is stored as 1000 cents, $1 = 100) to completely eliminate floating-point rounding errors in financial transactions.
+* reference_id : Optional UUID used to pair multi-part operations (like linking TRANSFER_OUT and TRANSFER_IN transactions together).
+
+# Idempotency Key Model:
+
+* Prevents duplicate financial operations caused by network retries or repeated API requests.
+* key: Unique string provided in HTTP request headers by client applications.
+* response_status & response_body: Caches the exact HTTP status code and JSON payload of the original request.
+* unique_together = ('tenant', 'key'): Ensures an API request key cannot be reused within the same tenant. If a client resends a request with the same key, your API instantly returns the cached response_body without executing the transaction twice.
+
+
+#====================== Middlewarey.py: ======================#
+JsonResponse : used to send direct 400 Bad request JSON error resposes if request faild
+MiddlewareMixin: A legacy Django helper class that allows defining middleware using process_request, process_response, and process_exception hooks.
+settings: Provides access to project configuration variables (like settings.DEBUG).
+set_current_tenant_id, clear_current_tenant_id: Thread-local storage functions. They bind a tenant ID to the current executing execution thread so your ORM managers (TenantScopedManager) can read it dynamically during database operations.
+
+
+# Bypassing Public & Administrative Endpoints
+
+* normalized_path = request.path.rstrip('/'): Removes trailing slashes from the requested URL path (e.g., /api/tenants/ becomes /api/tenants).
+* Exemption Check: Routes starting with /admin/, OpenAPI schema definitions (/api/schema/), or Swagger/ReDoc documentation (/api/docs/) do not require a tenant ID.
+* set_current_tenant_id(None): Explicitly un-sets any active tenant scope so admin and doc views can access unscoped data.
+
+# Tenant Identification & Fallback Logic
+
+* request.headers.get('X-Tenant-ID'): Attempts to read the custom X-Tenant-ID header from incoming HTTP request metadata.
+
+Debug Fallback (settings.DEBUG = True):
+    * If no X-Tenant-ID header is provided during local testing, it auto-assigns the ID of the first Tenant in the database (or hardcodes a dummy UUID). This allows quick testing in local browsers/Postman without passing headers every time.
+
+Production Logic (settings.DEBUG = False):
+    * If accessing public root API paths like /api or /api/tenants, tenant isolation is ignored (None).
+    * For all other API routes, if X-Tenant-ID is missing, execution is halted immediately with a 400 Bad Request JSON security error.
+
+
+# UUID Validation & Request Binding
+* uuid.UUID(tenant_id): Ensures the incoming X-Tenant-ID header string is a properly formatted 128-bit UUID. If malformed, returns a 400 Bad Request error immediately.
+* set_current_tenant_id(tenant_id): Stores the valid tenant_id in thread-local storage for ORM isolation.
+* request.tenant_id = tenant_id: Attaches tenant_id directly to Django's request object for easy access inside views and forms.
+* return None: Signal to Django that processing was successful and can continue to the view handler.
+
+# Thread Clean-up (Response & Exception Hooks)
+
+* process_response: Executed after a view generates a response. Calls clear_current_tenant_id() to reset thread-local state, preventing "tenant leak" bugs where a worker thread reuses tenant state on subsequent HTTP requests.
+* process_exception: Guarantees thread-local state is wiped clean even if an unexpected server error occurs during request execution.
+
+# ===================== views.py ======================#
+
+# Tenant ViewSet & Pagination
+
+* TenantViewSet : Provides complete CRUD Endpoints for tenants at /api/tenants/.
+* Permissin_classes = [] : Allow unrestricted publci access to tenatn endpoint.
+* MasterAuditTimelinePagination: Paginates API results. Defaults to 10 records per page, allows client override via ?page_size=X, capped at 100 max.
+
+# Customer ViewSet
+
+* get_queryset : handles tenatn filtering
+    * If ?all=true is passed by a staff user, fetches customers across all tenants (unscoped_objects).
+    * Otherwise, fetches customers isolated to the active tenant (Customer.objects.all()).
+
+* perform_create: Automatically injects tenant_id from the request header into the new customer record upon creation.
+* overall_history: Endpoint (/api/customers/<pk>/overall-history/) to get full transaction history across all wallets owned by a customer.
+* Checks permissions (show_all), fetches associated wallets, and queries transactions ordered by date. Returns 404 if the customer does not exist in scope.
+* Serializes customer and wallet metadata.
+* Applies pagination to transactions. Returns paginated JSON structure with metadata attached, or standard unpaginated array fallback.
+
+
+# Wallet ViewSet
+
+* Sets UUID lookup (lookup_field = 'id') and manages tenant-scoped querying and creation for wallets.
+# history: 
+    * Endpoint (/api/wallets/<id>/history/) returning a single wallet's transactions alongside live calculated balance and currency information.
+
+# Deposite:
+    * deposit: Decorates with @idempotent_endpoint() to prevent duplicate requests. Validates payload via DepositSerializer, executes deposit in service layer, and returns 201 Created.
+
+# WITHDRAW
+    * withdraw: Handles withdrawals with explicit error catching for InsufficientFundsError (400), CrossTenantOperationError (403), and missing wallets (404).
+
+# Transfer 
+    * transfer: Executes inter-wallet transfers within the same tenant. Returns both sender_transaction and receiver_transaction JSON objects upon success.
+
+# eligible_recipients: 
+    * Generates eligible target wallet options for frontend transfer dropdowns (matching tenant and currency, excluding self).
+
+# Audit ViewSet
+    * TransactionViewSet & IdempotencyKeyViewSet: Read-only audit trail endpoints (GET only) supporting staff-level unscoped views.
+
+
+
+# -=-=================== service.py ==========================#
+
+# Deposite:
+
+    * if Validates amount > 0 :
+        Opens transaction.atomic() context:
+            uses .select_for_update() to lock the wallet row in the database
+                Creates a positive Deposite transection entry.
+
+# withdraw:
+    
+    * Validates amount and locks the wallet database row.
+        Verifies wallet.balance >= amount.
+            Saves a negative transaction entry (amount = -amount).
+
+# transfer:
+
+    * Prevents self-transfers (sender_id == recipient_id).
+        * Deadlock Prevention: Sorts wallet IDs (sorted([sender, recipient])) prior to executing .select_for_update().in_bulk(ids). This guarantees rows are always locked in the exact same order across concurrent worker threads.
+            * Verifies both wallets belong to tenant_id.
+                * Checks sender balance and creates atomic TRANSFER_OUT and TRANSFER_IN transaction entries with an optional shared reference_id.
+
+
+
+# -========================= Decorates.py ================================
+
+# Method Filtering & Key Extraction
+
+* request.method Check: Bypasses safe read-only methods (GET, HEAD, OPTIONS), running idempotency logic strictly on write operations.
+* Key & Tenant Extraction: Reads Idempotency-Key or X-Idempotency-Key from headers along with request.tenant_id. If either is missing, it falls back to executing the view normally.
+
+# Cache Hit Handaling:
+    * Status 102 (Processing): If the original request is still executing, returns 409 Conflict to prevent parallel execution.
+    * Completed Status: If already processed, skips view execution entirely and returns the cached response_body and response_status.
+
+# In-Flight Record Creation
+
+* Creates a placeholder IdempotencyKey record with status 102 before executing the view.
+* Race Condition Guard: If two identical requests hit the server at the exact same millisecond, the database throws an IntegrityError due to the unique_together = ('tenant', 'key') constraint. The except IntegrityError block catches this and returns the processing (409) or cached response.
+
+# View Execution & Cache Persistence
+
+* Execution: Runs the underlying DRF view function.
+* Serialization: Renders response data through JSONRenderer() to convert DRF objects (like UUIDs, Datetimes) into JSON-compatible primitives.
+* Persist: Saves the final status code and response payload, overriding the initial 102 state.
+* Rollback on Exception: If an unhandled server error occurs during view execution, it deletes the IdempotencyKey record so the client can retry the request later.
+
